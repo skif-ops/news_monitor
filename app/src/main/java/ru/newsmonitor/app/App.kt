@@ -19,7 +19,9 @@ import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.rememberScrollState
@@ -50,6 +52,7 @@ import androidx.compose.material3.TopAppBar
 import androidx.compose.material3.darkColorScheme
 import androidx.compose.material3.lightColorScheme
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -59,8 +62,10 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalUriHandler
+import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
 import androidx.core.app.NotificationCompat
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.viewModelScope
@@ -70,6 +75,20 @@ import androidx.work.ExistingPeriodicWorkPolicy
 import androidx.work.PeriodicWorkRequestBuilder
 import androidx.work.WorkManager
 import androidx.work.WorkerParameters
+import dev.g000sha256.tdl.TdlClient
+import dev.g000sha256.tdl.TdlResult
+import dev.g000sha256.tdl.dto.AuthorizationStateReady
+import dev.g000sha256.tdl.dto.AuthorizationStateWaitCode
+import dev.g000sha256.tdl.dto.AuthorizationStateWaitPassword
+import dev.g000sha256.tdl.dto.AuthorizationStateWaitPhoneNumber
+import dev.g000sha256.tdl.dto.AuthorizationStateWaitTdlibParameters
+import dev.g000sha256.tdl.dto.Message
+import dev.g000sha256.tdl.dto.MessageAnimation
+import dev.g000sha256.tdl.dto.MessageAudio
+import dev.g000sha256.tdl.dto.MessageDocument
+import dev.g000sha256.tdl.dto.MessagePhoto
+import dev.g000sha256.tdl.dto.MessageText
+import dev.g000sha256.tdl.dto.MessageVideo
 import java.io.ByteArrayInputStream
 import java.io.ByteArrayOutputStream
 import java.io.File
@@ -118,6 +137,9 @@ data class Config(
     var intervalMinutes: Int = 30,
     var autoCheck: Boolean = false,
     var themeMode: String = "system",   // system | light | dark
+    var tgApiId: String = "",
+    var tgApiHash: String = "",
+    val tgChannels: MutableList<String> = mutableListOf(),
 )
 
 /** Найденная новость. */
@@ -143,6 +165,9 @@ object Storage {
         intervalMinutes = o.optInt("intervalMinutes", 30),
         autoCheck = o.optBoolean("autoCheck", false),
         themeMode = o.optString("themeMode", "system"),
+        tgApiId = o.optString("tgApiId"),
+        tgApiHash = o.optString("tgApiHash"),
+        tgChannels = o.optJSONArray("tgChannels").toStringList().toMutableList(),
     )
 
     fun loadConfig(context: Context): Config {
@@ -166,6 +191,9 @@ object Storage {
         o.put("intervalMinutes", config.intervalMinutes)
         o.put("autoCheck", config.autoCheck)
         o.put("themeMode", config.themeMode)
+        o.put("tgApiId", config.tgApiId)
+        o.put("tgApiHash", config.tgApiHash)
+        o.put("tgChannels", JSONArray(config.tgChannels))
         return o
     }
 
@@ -496,6 +524,185 @@ object VkSource {
     }
 }
 
+// ===================== TelegramSource.kt =====================
+
+/**
+ * Мониторинг открытых Telegram-каналов через TDLib (официальный движок Telegram).
+ * Вход в аккаунт выполняется один раз в настройках приложения:
+ * api_id/api_hash (с my.telegram.org) -> телефон -> код из Telegram -> при
+ * необходимости облачный пароль. Сессия хранится в папке приложения.
+ */
+object TgEngine {
+
+    // человекочитаемые состояния для интерфейса
+    const val NOT_CONFIGURED = "not_configured"
+    const val WAIT_PHONE = "wait_phone"
+    const val WAIT_CODE = "wait_code"
+    const val WAIT_PASSWORD = "wait_password"
+    const val READY = "ready"
+
+    @Volatile
+    private var client: TdlClient? = null
+
+    private fun client(): TdlClient =
+        client ?: synchronized(this) { client ?: TdlClient.create().also { client = it } }
+
+    private fun <T : Any> TdlResult<T>.orNull(): T? = (this as? TdlResult.Success)?.result
+
+    private fun TdlResult<*>.errorText(): String? =
+        (this as? TdlResult.Failure)?.let { "${it.message} (код ${it.code})" }
+
+    /** Передаёт TDLib параметры запуска, если он их ждёт. */
+    private suspend fun ensureParameters(context: Context, config: Config): String? {
+        val apiId = config.tgApiId.trim().toIntOrNull() ?: return "api_id должен быть числом"
+        if (config.tgApiHash.isBlank()) return "не задан api_hash"
+        val state = client().getAuthorizationState().orNull()
+        if (state is AuthorizationStateWaitTdlibParameters) {
+            val dir = File(context.filesDir, "tdlib").apply { mkdirs() }
+            val result = client().setTdlibParameters(
+                useTestDc = false,
+                databaseDirectory = dir.absolutePath,
+                filesDirectory = dir.absolutePath,
+                databaseEncryptionKey = ByteArray(0),
+                useFileDatabase = false,
+                useChatInfoDatabase = false,
+                useMessageDatabase = false,
+                useSecretChats = false,
+                apiId = apiId,
+                apiHash = config.tgApiHash.trim(),
+                systemLanguageCode = "ru",
+                deviceModel = "Android",
+                systemVersion = "",
+                applicationVersion = "1.0",
+            )
+            result.errorText()?.let { return it }
+        }
+        return null
+    }
+
+    /** Текущее состояние входа (или "error: ..."). */
+    suspend fun authState(context: Context, config: Config): String {
+        if (config.tgApiId.isBlank() || config.tgApiHash.isBlank()) return NOT_CONFIGURED
+        ensureParameters(context, config)?.let { return "error: $it" }
+        val result = client().getAuthorizationState()
+        return when (result.orNull()) {
+            is AuthorizationStateReady -> READY
+            is AuthorizationStateWaitPhoneNumber -> WAIT_PHONE
+            is AuthorizationStateWaitCode -> WAIT_CODE
+            is AuthorizationStateWaitPassword -> WAIT_PASSWORD
+            is AuthorizationStateWaitTdlibParameters -> WAIT_PHONE
+            null -> "error: ${result.errorText() ?: "нет ответа TDLib"}"
+            else -> "error: неожиданное состояние входа"
+        }
+    }
+
+    suspend fun sendPhone(context: Context, config: Config, phone: String): String? {
+        ensureParameters(context, config)?.let { return it }
+        return client().setAuthenticationPhoneNumber(phoneNumber = phone.trim(), settings = null)
+            .errorText()
+    }
+
+    suspend fun sendCode(code: String): String? =
+        client().checkAuthenticationCode(code = code.trim()).errorText()
+
+    suspend fun sendPassword(password: String): String? =
+        client().checkAuthenticationPassword(password = password).errorText()
+
+    private fun messageText(m: Message): String = when (val c = m.content) {
+        is MessageText -> c.text.text
+        is MessagePhoto -> c.caption.text
+        is MessageVideo -> c.caption.text
+        is MessageDocument -> c.caption.text
+        is MessageAnimation -> c.caption.text
+        is MessageAudio -> c.caption.text
+        else -> ""
+    }
+
+    /** Последние сообщения открытого канала (история подгружается порциями). */
+    suspend fun fetchChannel(username: String, limit: Int): Pair<List<Message>, String?> {
+        val chatResult = client().searchPublicChat(username = username)
+        val chat = chatResult.orNull()
+            ?: return emptyList<Message>() to (chatResult.errorText() ?: "канал не найден")
+        val collected = mutableListOf<Message>()
+        var fromMessageId = 0L
+        repeat(8) {
+            val history = client().getChatHistory(
+                chatId = chat.id,
+                fromMessageId = fromMessageId,
+                offset = 0,
+                limit = 50,
+                onlyLocal = false,
+            )
+            val portion = history.orNull()?.messages?.filterNotNull().orEmpty()
+            if (portion.isEmpty()) return collected to null
+            collected.addAll(portion)
+            fromMessageId = portion.last().id
+            if (collected.size >= limit) return collected.take(limit) to null
+        }
+        return collected to null
+    }
+
+    fun extract(m: Message, username: String): Triple<String, String, String> {
+        // текст, ссылка, дата
+        val text = messageText(m).trim()
+        val link = "https://t.me/$username/${m.id shr 20}"
+        val date = SimpleDateFormat("dd.MM.yyyy HH:mm", Locale.getDefault())
+            .format(Date(m.date.toLong() * 1000))
+        return Triple(text, link, date)
+    }
+}
+
+/** Проверка Telegram-каналов по ключевым словам (общий формат с RSS и VK). */
+object TgSource {
+
+    fun normalizeChannel(raw: String): String = raw.trim()
+        .replace(Regex("^https?://t\\.me/(s/)?", RegexOption.IGNORE_CASE), "")
+        .trimStart('@').trim('/')
+        .substringBefore("?").substringBefore("/")
+
+    suspend fun check(
+        context: Context, config: Config,
+        patterns: List<Pair<String, Pattern>>, seen: MutableSet<String>,
+        log: (String) -> Unit,
+    ): List<NewsItem> {
+        val found = mutableListOf<NewsItem>()
+        if (config.tgChannels.isEmpty()) return found
+
+        val state = TgEngine.authState(context, config)
+        if (state != TgEngine.READY) {
+            log("Telegram: аккаунт не подключён — откройте настройки (шестерёнка) " +
+                "и выполните вход в разделе Telegram.")
+            return found
+        }
+
+        for (raw in config.tgChannels) {
+            val channel = normalizeChannel(raw)
+            val (messages, error) = TgEngine.fetchChannel(channel, 50)
+            if (error != null) {
+                log("Telegram @$channel: $error")
+                continue
+            }
+            for (m in messages) {
+                val (text, link, date) = TgEngine.extract(m, channel)
+                if (text.isEmpty() || link in seen) continue
+                val matched = Matcher.match(text, patterns)
+                if (matched.isEmpty()) continue
+                val firstLine = text.lineSequence().first()
+                found.add(NewsItem(
+                    date = date,
+                    source = "Telegram: @$channel",
+                    title = if (firstLine.length > 120) firstLine.take(120) + "…" else firstLine,
+                    keywords = matched.joinToString(", "),
+                    link = link,
+                    summary = text.take(500),
+                ))
+                seen.add(link)
+            }
+        }
+        return found
+    }
+}
+
 // ===================== Checker.kt =====================
 
 /** Одна проверка всех источников. Возвращает найденные новости и журнал. */
@@ -503,7 +710,7 @@ object Checker {
 
     data class Result(val found: List<NewsItem>, val log: List<String>)
 
-    fun runCheck(context: Context): Result {
+    suspend fun runCheck(context: Context): Result {
         val config = Storage.loadConfig(context)
         val seen = Storage.loadSeen(context)
         val patterns = Matcher.compile(config.keywords)
@@ -515,6 +722,7 @@ object Checker {
             found.addAll(rows)
         }
         found.addAll(VkSource.check(context, config, patterns, seen) { log.add(it) })
+        found.addAll(TgSource.check(context, config, patterns, seen) { log.add(it) })
 
         if (found.isNotEmpty()) {
             val all = Storage.loadNews(context) + found
@@ -775,6 +983,32 @@ class MainViewModel(private val app: android.app.Application) :
         }
     }
 
+    private val _tgStatus = MutableStateFlow("")
+    val tgStatus = _tgStatus.asStateFlow()
+
+    fun refreshTgStatus() {
+        viewModelScope.launch {
+            _tgStatus.value = withContext(Dispatchers.IO) {
+                try { TgEngine.authState(app, _config.value) }
+                catch (e: Throwable) { "error: ${e.message ?: e.javaClass.simpleName}" }
+            }
+        }
+    }
+
+    private fun tgAction(block: suspend () -> String?) {
+        viewModelScope.launch {
+            val error = withContext(Dispatchers.IO) {
+                try { block() } catch (e: Throwable) { e.message ?: e.javaClass.simpleName }
+            }
+            if (error != null) _tgStatus.value = "error: $error"
+            else refreshTgStatus()
+        }
+    }
+
+    fun tgSendPhone(phone: String) = tgAction { TgEngine.sendPhone(app, _config.value, phone) }
+    fun tgSendCode(code: String) = tgAction { TgEngine.sendCode(code) }
+    fun tgSendPassword(password: String) = tgAction { TgEngine.sendPassword(password) }
+
     fun exportSettings(): ByteArray = Storage.exportBackup(app).toByteArray(Charsets.UTF_8)
 
     fun importSettings(text: String): String = try {
@@ -849,7 +1083,7 @@ fun MainScreen(vm: MainViewModel = viewModel()) {
                         )
                     },
                     bottomBar = {
-                        Column(Modifier.padding(12.dp)) {
+                        Column(Modifier.navigationBarsPadding().padding(12.dp)) {
                             Text(status, style = MaterialTheme.typography.bodySmall)
                             Row(
                                 Modifier.fillMaxWidth(),
@@ -872,7 +1106,7 @@ fun MainScreen(vm: MainViewModel = viewModel()) {
                 ) { padding ->
                     Column(Modifier.padding(padding).fillMaxSize()) {
                         TabRow(selectedTabIndex = tab) {
-                            listOf("Новости", "Слова", "RSS", "VK").forEachIndexed { i, name ->
+                            listOf("Новости", "Слова", "RSS", "VK", "TG").forEachIndexed { i, name ->
                                 Tab(selected = tab == i, onClick = { tab = i },
                                     text = { Text(name) })
                             }
@@ -882,6 +1116,7 @@ fun MainScreen(vm: MainViewModel = viewModel()) {
                             1 -> KeywordsTab(config, vm)
                             2 -> FeedsTab(config, vm)
                             3 -> VkTab(config, vm)
+                            4 -> TgTab(config, vm)
                         }
                     }
                 }
@@ -892,7 +1127,8 @@ fun MainScreen(vm: MainViewModel = viewModel()) {
 
 @Composable
 fun SettingsScreen(config: Config, vm: MainViewModel, onBack: () -> Unit) {
-    Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(12.dp)) {
+    Column(Modifier.fillMaxSize().statusBarsPadding().navigationBarsPadding()
+        .verticalScroll(rememberScrollState()).padding(12.dp)) {
         Row(verticalAlignment = Alignment.CenterVertically) {
             IconButton(onClick = onBack) {
                 Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "Назад")
@@ -946,6 +1182,86 @@ fun SettingsScreen(config: Config, vm: MainViewModel, onBack: () -> Unit) {
         )
         Text("Ключ сохраняется автоматически.",
             style = MaterialTheme.typography.bodySmall)
+
+        Text("Telegram", style = MaterialTheme.typography.titleMedium,
+            modifier = Modifier.padding(top = 16.dp))
+        val tgStatus by vm.tgStatus.collectAsState()
+        LaunchedEffect(Unit) { vm.refreshTgStatus() }
+        var tgApiId by remember(config.tgApiId) { mutableStateOf(config.tgApiId) }
+        var tgApiHash by remember(config.tgApiHash) { mutableStateOf(config.tgApiHash) }
+        OutlinedTextField(
+            value = tgApiId,
+            onValueChange = { new ->
+                tgApiId = new.filter { it.isDigit() }
+                vm.update { it.tgApiId = tgApiId }
+            },
+            label = { Text("api_id (число, с my.telegram.org)") },
+            keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
+            modifier = Modifier.fillMaxWidth(),
+        )
+        OutlinedTextField(
+            value = tgApiHash,
+            onValueChange = { new ->
+                tgApiHash = new
+                vm.update { it.tgApiHash = new.trim() }
+            },
+            label = { Text("api_hash (с my.telegram.org)") },
+            modifier = Modifier.fillMaxWidth(),
+        )
+        Text("Получите api_id и api_hash бесплатно на my.telegram.org: войдите " +
+            "по номеру телефона, откройте «API development tools», создайте " +
+            "приложение с любым названием.",
+            style = MaterialTheme.typography.bodySmall)
+
+        when {
+            tgStatus == TgEngine.READY -> {
+                Text("Вход в Telegram выполнен ✓",
+                    color = MaterialTheme.colorScheme.primary,
+                    modifier = Modifier.padding(top = 8.dp))
+            }
+            tgStatus == TgEngine.WAIT_PHONE -> {
+                var tgPhone by remember { mutableStateOf("") }
+                OutlinedTextField(
+                    value = tgPhone, onValueChange = { tgPhone = it },
+                    label = { Text("Телефон аккаунта Telegram (+7...)") },
+                    modifier = Modifier.fillMaxWidth().padding(top = 8.dp),
+                )
+                Button(onClick = { vm.tgSendPhone(tgPhone) },
+                    modifier = Modifier.fillMaxWidth()) { Text("Получить код") }
+            }
+            tgStatus == TgEngine.WAIT_CODE -> {
+                var tgCode by remember { mutableStateOf("") }
+                OutlinedTextField(
+                    value = tgCode, onValueChange = { tgCode = it },
+                    label = { Text("Код подтверждения из Telegram") },
+                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
+                    modifier = Modifier.fillMaxWidth().padding(top = 8.dp),
+                )
+                Button(onClick = { vm.tgSendCode(tgCode) },
+                    modifier = Modifier.fillMaxWidth()) { Text("Войти") }
+            }
+            tgStatus == TgEngine.WAIT_PASSWORD -> {
+                var tgPassword by remember { mutableStateOf("") }
+                OutlinedTextField(
+                    value = tgPassword, onValueChange = { tgPassword = it },
+                    label = { Text("Облачный пароль (двухэтапная проверка)") },
+                    modifier = Modifier.fillMaxWidth().padding(top = 8.dp),
+                )
+                Button(onClick = { vm.tgSendPassword(tgPassword) },
+                    modifier = Modifier.fillMaxWidth()) { Text("Подтвердить") }
+            }
+            tgStatus.startsWith("error:") -> {
+                Text("Ошибка: ${tgStatus.removePrefix("error:").trim()}",
+                    color = MaterialTheme.colorScheme.error,
+                    modifier = Modifier.padding(top = 8.dp))
+                OutlinedButton(onClick = { vm.refreshTgStatus() }) { Text("Повторить") }
+            }
+            else -> {
+                Text("Заполните api_id и api_hash — появится поле для входа.",
+                    style = MaterialTheme.typography.bodySmall,
+                    modifier = Modifier.padding(top = 8.dp))
+            }
+        }
 
         Text("Резервная копия", style = MaterialTheme.typography.titleMedium,
             modifier = Modifier.padding(top = 16.dp))
@@ -1011,15 +1327,19 @@ fun NewsTab(news: List<NewsItem>, onExport: () -> Unit) {
             items(news) { item ->
                 Card(Modifier.fillMaxWidth().padding(vertical = 4.dp)) {
                     Column(Modifier.padding(10.dp)) {
-                        Text(item.title, style = MaterialTheme.typography.titleSmall,
+                        Text(item.title,
+                            fontSize = 13.sp, lineHeight = 17.sp,
+                            fontWeight = FontWeight.SemiBold,
                             color = MaterialTheme.colorScheme.primary)
                         Text("${item.source}  |  ${item.date}",
-                            style = MaterialTheme.typography.bodySmall)
+                            fontSize = 11.sp, lineHeight = 14.sp,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant)
                         Text("Ключевые слова: ${item.keywords}",
-                            style = MaterialTheme.typography.bodySmall)
+                            fontSize = 11.sp, lineHeight = 14.sp,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant)
                         if (item.summary.isNotBlank()) {
                             Text(item.summary.take(200),
-                                style = MaterialTheme.typography.bodyMedium)
+                                fontSize = 12.sp, lineHeight = 16.sp)
                         }
                         TextButton(onClick = { uriHandler.openUri(item.link) }) {
                             Text("Открыть источник")
@@ -1154,6 +1474,22 @@ fun FeedsTab(config: Config, vm: MainViewModel) {
             dismissButton = {
                 TextButton(onClick = { showDialog = false }) { Text("Отмена") }
             },
+        )
+    }
+}
+
+@Composable
+fun TgTab(config: Config, vm: MainViewModel) {
+    Column(Modifier.fillMaxSize()) {
+        ListEditor(
+            title = "Telegram-каналы",
+            hint = "Канал можно указать любым способом: @durov, durov или " +
+                "https://t.me/durov. Вход в аккаунт Telegram выполняется " +
+                "в настройках (значок шестерёнки вверху).",
+            items = config.tgChannels,
+            dialogLabel = "Новый Telegram-канал",
+            onAdd = { ch -> vm.update { it.tgChannels.add(TgSource.normalizeChannel(ch)) } },
+            onRemove = { i -> vm.update { it.tgChannels.removeAt(i) } },
         )
     }
 }
