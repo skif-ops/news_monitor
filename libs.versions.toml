@@ -1,0 +1,116 @@
+package ru.newsmonitor.app
+
+import android.content.Context
+import org.json.JSONArray
+import org.json.JSONObject
+import java.io.File
+
+/** Настройки программы. */
+data class Feed(val name: String, val url: String)
+
+data class Config(
+    val keywords: MutableList<String> = mutableListOf("нейросет", "санкци"),
+    val feeds: MutableList<Feed> = mutableListOf(
+        Feed("ТАСС", "https://tass.ru/rss/v2.xml"),
+        Feed("РИА Новости", "https://ria.ru/export/rss2/archive/index.xml"),
+        Feed("Lenta.ru", "https://lenta.ru/rss/news"),
+        Feed("Коммерсантъ", "https://www.kommersant.ru/RSS/news.xml"),
+        Feed("РБК", "https://rssexport.rbc.ru/rbcnews/news/30/full.rss"),
+    ),
+    val vkGroups: MutableList<String> = mutableListOf(),
+    var vkToken: String = "",
+    var intervalMinutes: Int = 30,
+    var autoCheck: Boolean = false,
+)
+
+/** Найденная новость. */
+data class NewsItem(
+    val date: String,
+    val source: String,
+    val title: String,
+    val keywords: String,
+    val link: String,
+    val summary: String,
+)
+
+object Storage {
+    private fun file(context: Context, name: String) = File(context.filesDir, name)
+
+    fun loadConfig(context: Context): Config {
+        val f = file(context, "config.json")
+        if (!f.exists()) return Config()
+        return try {
+            val o = JSONObject(f.readText())
+            Config(
+                keywords = o.optJSONArray("keywords").toStringList().toMutableList(),
+                feeds = o.optJSONArray("feeds").toObjectList().map {
+                    Feed(it.optString("name"), it.optString("url"))
+                }.toMutableList(),
+                vkGroups = o.optJSONArray("vkGroups").toStringList().toMutableList(),
+                vkToken = o.optString("vkToken"),
+                intervalMinutes = o.optInt("intervalMinutes", 30),
+                autoCheck = o.optBoolean("autoCheck", false),
+            )
+        } catch (_: Exception) {
+            Config()
+        }
+    }
+
+    fun saveConfig(context: Context, config: Config) {
+        val o = JSONObject()
+        o.put("keywords", JSONArray(config.keywords))
+        o.put("feeds", JSONArray(config.feeds.map {
+            JSONObject().put("name", it.name).put("url", it.url)
+        }))
+        o.put("vkGroups", JSONArray(config.vkGroups))
+        o.put("vkToken", config.vkToken)
+        o.put("intervalMinutes", config.intervalMinutes)
+        o.put("autoCheck", config.autoCheck)
+        file(context, "config.json").writeText(o.toString(2))
+    }
+
+    fun loadNews(context: Context): List<NewsItem> {
+        val f = file(context, "news.json")
+        if (!f.exists()) return emptyList()
+        return try {
+            JSONArray(f.readText()).let { arr ->
+                (0 until arr.length()).map { i ->
+                    val o = arr.getJSONObject(i)
+                    NewsItem(
+                        o.optString("date"), o.optString("source"),
+                        o.optString("title"), o.optString("keywords"),
+                        o.optString("link"), o.optString("summary"),
+                    )
+                }
+            }
+        } catch (_: Exception) {
+            emptyList()
+        }
+    }
+
+    fun saveNews(context: Context, news: List<NewsItem>) {
+        val arr = JSONArray(news.takeLast(500).map {
+            JSONObject()
+                .put("date", it.date).put("source", it.source)
+                .put("title", it.title).put("keywords", it.keywords)
+                .put("link", it.link).put("summary", it.summary)
+        })
+        file(context, "news.json").writeText(arr.toString())
+    }
+
+    fun loadSeen(context: Context): MutableSet<String> {
+        val f = file(context, "seen.txt")
+        return if (f.exists()) f.readLines().filter { it.isNotBlank() }.toMutableSet()
+        else mutableSetOf()
+    }
+
+    fun saveSeen(context: Context, seen: Set<String>) {
+        file(context, "seen.txt").writeText(seen.joinToString("\n"))
+    }
+
+    private fun JSONArray?.toStringList(): List<String> =
+        this?.let { arr -> (0 until arr.length()).map { arr.getString(it) } } ?: emptyList()
+
+    private fun JSONArray?.toObjectList(): List<JSONObject> =
+        this?.let { arr -> (0 until arr.length()).map { arr.getJSONObject(it) } } ?: emptyList()
+}
