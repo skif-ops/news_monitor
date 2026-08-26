@@ -4,8 +4,16 @@ plugins {
     alias(libs.plugins.kotlin.compose)
 }
 
-// номер версии растёт сам с каждой сборкой на GitHub —
-// поэтому каждая новая сборка считается обновлением предыдущей
+// ============================================================
+// ВЕРСИЯ ПРИЛОЖЕНИЯ — меняйте эту строку при выпуске:
+//   третья цифра — незначительные доработки (1.3.0 -> 1.3.1)
+//   вторая цифра — большой релиз            (1.3.x -> 1.4.0)
+//   первая цифра — коренное обновление      (1.x.x -> 2.0.0)
+val appVersionName = "1.3.1"
+// ============================================================
+
+// внутренний счётчик сборок (невидим пользователю): растёт сам,
+// поэтому каждая сборка ставится поверх предыдущей как обновление
 val ciRunNumber = System.getenv("GITHUB_RUN_NUMBER")?.toIntOrNull() ?: 1
 
 android {
@@ -17,7 +25,7 @@ android {
         minSdk = 26
         targetSdk = 35
         versionCode = ciRunNumber
-        versionName = "1.$ciRunNumber"
+        versionName = appVersionName
         ndk { abiFilters.addAll(listOf("arm64-v8a", "armeabi-v7a")) }
     }
 
@@ -49,7 +57,10 @@ android {
         targetCompatibility = JavaVersion.VERSION_17
     }
     kotlinOptions { jvmTarget = "17" }
-    buildFeatures { compose = true }
+    buildFeatures {
+        compose = true
+        buildConfig = true
+    }
 }
 
 dependencies {
@@ -63,3 +74,4 @@ dependencies {
     implementation(libs.okhttp)
     implementation(libs.tdl.coroutines)
 }
+
