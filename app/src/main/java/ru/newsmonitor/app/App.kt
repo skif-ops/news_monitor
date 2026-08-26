@@ -13,6 +13,7 @@ import androidx.activity.ComponentActivity
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.foundation.isSystemInDarkTheme
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
@@ -21,19 +22,33 @@ import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.text.KeyboardOptions
+import androidx.compose.foundation.verticalScroll
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.filled.ArrowBack
+import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.Card
+import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.HorizontalDivider
+import androidx.compose.material3.Icon
+import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
+import androidx.compose.material3.RadioButton
 import androidx.compose.material3.Scaffold
+import androidx.compose.material3.Surface
 import androidx.compose.material3.Switch
 import androidx.compose.material3.Tab
 import androidx.compose.material3.TabRow
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
+import androidx.compose.material3.TopAppBar
+import androidx.compose.material3.darkColorScheme
+import androidx.compose.material3.lightColorScheme
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
@@ -44,10 +59,10 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalUriHandler
+import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.unit.dp
 import androidx.core.app.NotificationCompat
 import androidx.core.content.ContextCompat
-import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import androidx.lifecycle.viewmodel.compose.viewModel
 import androidx.work.CoroutineWorker
@@ -102,6 +117,7 @@ data class Config(
     var vkToken: String = "",
     var intervalMinutes: Int = 30,
     var autoCheck: Boolean = false,
+    var themeMode: String = "system",   // system | light | dark
 )
 
 /** Найденная новость. */
@@ -117,27 +133,29 @@ data class NewsItem(
 object Storage {
     private fun file(context: Context, name: String) = File(context.filesDir, name)
 
+    private fun parseConfig(o: JSONObject) = Config(
+        keywords = o.optJSONArray("keywords").toStringList().toMutableList(),
+        feeds = o.optJSONArray("feeds").toObjectList().map {
+            Feed(it.optString("name"), it.optString("url"))
+        }.toMutableList(),
+        vkGroups = o.optJSONArray("vkGroups").toStringList().toMutableList(),
+        vkToken = o.optString("vkToken"),
+        intervalMinutes = o.optInt("intervalMinutes", 30),
+        autoCheck = o.optBoolean("autoCheck", false),
+        themeMode = o.optString("themeMode", "system"),
+    )
+
     fun loadConfig(context: Context): Config {
         val f = file(context, "config.json")
         if (!f.exists()) return Config()
         return try {
-            val o = JSONObject(f.readText())
-            Config(
-                keywords = o.optJSONArray("keywords").toStringList().toMutableList(),
-                feeds = o.optJSONArray("feeds").toObjectList().map {
-                    Feed(it.optString("name"), it.optString("url"))
-                }.toMutableList(),
-                vkGroups = o.optJSONArray("vkGroups").toStringList().toMutableList(),
-                vkToken = o.optString("vkToken"),
-                intervalMinutes = o.optInt("intervalMinutes", 30),
-                autoCheck = o.optBoolean("autoCheck", false),
-            )
+            parseConfig(JSONObject(f.readText()))
         } catch (_: Exception) {
             Config()
         }
     }
 
-    fun saveConfig(context: Context, config: Config) = try {
+    private fun configToJson(config: Config): JSONObject {
         val o = JSONObject()
         o.put("keywords", JSONArray(config.keywords))
         o.put("feeds", JSONArray(config.feeds.map {
@@ -147,8 +165,34 @@ object Storage {
         o.put("vkToken", config.vkToken)
         o.put("intervalMinutes", config.intervalMinutes)
         o.put("autoCheck", config.autoCheck)
-        file(context, "config.json").writeText(o.toString(2))
+        o.put("themeMode", config.themeMode)
+        return o
+    }
+
+    fun saveConfig(context: Context, config: Config) = try {
+        file(context, "config.json").writeText(configToJson(config).toString(2))
     } catch (_: Exception) {
+    }
+
+    /** Резервная копия: настройки + память об уже найденных новостях. */
+    fun exportBackup(context: Context): String {
+        val o = JSONObject()
+        o.put("type", "newsmonitor-backup")
+        o.put("config", configToJson(loadConfig(context)))
+        o.put("seen", JSONArray(loadSeen(context).toList()))
+        return o.toString(2)
+    }
+
+    /** Восстановление из файла резервной копии. Возвращает новые настройки. */
+    fun importBackup(context: Context, text: String): Config {
+        val o = JSONObject(text)
+        val cfgJson = if (o.has("config")) o.getJSONObject("config") else o
+        val config = parseConfig(cfgJson)
+        saveConfig(context, config)
+        o.optJSONArray("seen")?.let { arr ->
+            saveSeen(context, (0 until arr.length()).map { arr.getString(it) }.toSet())
+        }
+        return config
     }
 
     fun loadNews(context: Context): List<NewsItem> {
@@ -731,6 +775,16 @@ class MainViewModel(private val app: android.app.Application) :
         }
     }
 
+    fun exportSettings(): ByteArray = Storage.exportBackup(app).toByteArray(Charsets.UTF_8)
+
+    fun importSettings(text: String): String = try {
+        val cfg = Storage.importBackup(app, text)
+        _config.value = cfg
+        "Настройки импортированы."
+    } catch (e: Exception) {
+        "Не удалось прочитать файл: ${e.message ?: "неверный формат"}"
+    }
+
     fun exportBytes(): ByteArray {
         val title = "Новости — мониторинг на " +
             SimpleDateFormat("dd.MM.yyyy", Locale.getDefault()).format(Date())
@@ -742,10 +796,11 @@ class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         Checker.ensureChannel(this)
-        setContent { MaterialTheme { MainScreen() } }
+        setContent { MainScreen() }
     }
 }
 
+@OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun MainScreen(vm: MainViewModel = viewModel()) {
     val config by vm.config.collectAsState()
@@ -753,7 +808,14 @@ fun MainScreen(vm: MainViewModel = viewModel()) {
     val status by vm.status.collectAsState()
     val checking by vm.checking.collectAsState()
     var tab by remember { mutableStateOf(0) }
+    var showSettings by remember { mutableStateOf(false) }
     val context = LocalContext.current
+
+    val darkTheme = when (config.themeMode) {
+        "dark" -> true
+        "light" -> false
+        else -> isSystemInDarkTheme()
+    }
 
     val notifPermission = rememberLauncherForActivityResult(
         ActivityResultContracts.RequestPermission()) { }
@@ -769,39 +831,163 @@ fun MainScreen(vm: MainViewModel = viewModel()) {
         }
     }
 
-    Scaffold(bottomBar = {
-        Column(Modifier.padding(12.dp)) {
-            Text(status, style = MaterialTheme.typography.bodySmall)
-            Row(
-                Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.spacedBy(8.dp),
-                verticalAlignment = Alignment.CenterVertically,
-            ) {
-                Button(onClick = { vm.checkNow() }, enabled = !checking,
-                    modifier = Modifier.weight(1f)) { Text("Проверить сейчас") }
-                Text("Авто")
-                Switch(checked = config.autoCheck, onCheckedChange = { enabled ->
-                    if (enabled && Build.VERSION.SDK_INT >= 33) {
-                        notifPermission.launch(android.Manifest.permission.POST_NOTIFICATIONS)
+    MaterialTheme(colorScheme = if (darkTheme) darkColorScheme() else lightColorScheme()) {
+        Surface(Modifier.fillMaxSize(), color = MaterialTheme.colorScheme.background) {
+            if (showSettings) {
+                SettingsScreen(config, vm, onBack = { showSettings = false })
+            } else {
+                Scaffold(
+                    topBar = {
+                        TopAppBar(
+                            title = { Text("Мониторинг новостей") },
+                            actions = {
+                                IconButton(onClick = { showSettings = true }) {
+                                    Icon(Icons.Filled.Settings,
+                                        contentDescription = "Настройки")
+                                }
+                            },
+                        )
+                    },
+                    bottomBar = {
+                        Column(Modifier.padding(12.dp)) {
+                            Text(status, style = MaterialTheme.typography.bodySmall)
+                            Row(
+                                Modifier.fillMaxWidth(),
+                                horizontalArrangement = Arrangement.spacedBy(8.dp),
+                                verticalAlignment = Alignment.CenterVertically,
+                            ) {
+                                Button(onClick = { vm.checkNow() }, enabled = !checking,
+                                    modifier = Modifier.weight(1f)) { Text("Проверить сейчас") }
+                                Text("Авто")
+                                Switch(checked = config.autoCheck, onCheckedChange = { enabled ->
+                                    if (enabled && Build.VERSION.SDK_INT >= 33) {
+                                        notifPermission.launch(
+                                            android.Manifest.permission.POST_NOTIFICATIONS)
+                                    }
+                                    vm.setAutoCheck(enabled)
+                                })
+                            }
+                        }
+                    },
+                ) { padding ->
+                    Column(Modifier.padding(padding).fillMaxSize()) {
+                        TabRow(selectedTabIndex = tab) {
+                            listOf("Новости", "Слова", "RSS", "VK").forEachIndexed { i, name ->
+                                Tab(selected = tab == i, onClick = { tab = i },
+                                    text = { Text(name) })
+                            }
+                        }
+                        when (tab) {
+                            0 -> NewsTab(news) { exporter.launch("новости_мониторинг.docx") }
+                            1 -> KeywordsTab(config, vm)
+                            2 -> FeedsTab(config, vm)
+                            3 -> VkTab(config, vm)
+                        }
                     }
-                    vm.setAutoCheck(enabled)
-                })
-            }
-        }
-    }) { padding ->
-        Column(Modifier.padding(padding).fillMaxSize()) {
-            TabRow(selectedTabIndex = tab) {
-                listOf("Новости", "Слова", "RSS", "VK").forEachIndexed { i, name ->
-                    Tab(selected = tab == i, onClick = { tab = i },
-                        text = { Text(name) })
                 }
             }
-            when (tab) {
-                0 -> NewsTab(news) { exporter.launch("новости_мониторинг.docx") }
-                1 -> KeywordsTab(config, vm)
-                2 -> FeedsTab(config, vm)
-                3 -> VkTab(config, vm)
+        }
+    }
+}
+
+@Composable
+fun SettingsScreen(config: Config, vm: MainViewModel, onBack: () -> Unit) {
+    Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(12.dp)) {
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            IconButton(onClick = onBack) {
+                Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "Назад")
             }
+            Text("Настройки", style = MaterialTheme.typography.titleLarge)
+        }
+
+        Text("Тема оформления", style = MaterialTheme.typography.titleMedium,
+            modifier = Modifier.padding(top = 16.dp))
+        listOf("system" to "Как в системе", "light" to "Светлая", "dark" to "Тёмная")
+            .forEach { (value, label) ->
+                Row(verticalAlignment = Alignment.CenterVertically,
+                    modifier = Modifier.fillMaxWidth()) {
+                    RadioButton(selected = config.themeMode == value,
+                        onClick = { vm.update { it.themeMode = value } })
+                    Text(label)
+                }
+            }
+
+        Text("Автопроверка", style = MaterialTheme.typography.titleMedium,
+            modifier = Modifier.padding(top = 16.dp))
+        var intervalText by remember(config.intervalMinutes) {
+            mutableStateOf(config.intervalMinutes.toString())
+        }
+        OutlinedTextField(
+            value = intervalText,
+            onValueChange = { new ->
+                intervalText = new.filter { it.isDigit() }.take(4)
+                intervalText.toIntOrNull()?.let { minutes ->
+                    if (minutes >= 15) vm.update { it.intervalMinutes = minutes }
+                }
+            },
+            label = { Text("Интервал, минут (не меньше 15)") },
+            keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
+            modifier = Modifier.fillMaxWidth(),
+        )
+        Text("Применяется при следующем включении переключателя «Авто».",
+            style = MaterialTheme.typography.bodySmall)
+
+        Text("ВКонтакте", style = MaterialTheme.typography.titleMedium,
+            modifier = Modifier.padding(top = 16.dp))
+        var token by remember(config.vkToken) { mutableStateOf(config.vkToken) }
+        OutlinedTextField(
+            value = token,
+            onValueChange = { new ->
+                token = new
+                vm.update { it.vkToken = new.trim() }
+            },
+            label = { Text("Ключ доступа VK (с dev.vk.com)") },
+            modifier = Modifier.fillMaxWidth(),
+        )
+        Text("Ключ сохраняется автоматически.",
+            style = MaterialTheme.typography.bodySmall)
+
+        Text("Резервная копия", style = MaterialTheme.typography.titleMedium,
+            modifier = Modifier.padding(top = 16.dp))
+        val context = LocalContext.current
+        var backupMessage by remember { mutableStateOf("") }
+        val backupExporter = rememberLauncherForActivityResult(
+            ActivityResultContracts.CreateDocument("application/json")
+        ) { uri ->
+            uri?.let {
+                context.contentResolver.openOutputStream(it)?.use { out ->
+                    out.write(vm.exportSettings())
+                }
+                backupMessage = "Файл настроек сохранён."
+            }
+        }
+        val backupImporter = rememberLauncherForActivityResult(
+            ActivityResultContracts.OpenDocument()
+        ) { uri ->
+            uri?.let {
+                val text = context.contentResolver.openInputStream(it)
+                    ?.bufferedReader()?.use { r -> r.readText() } ?: ""
+                backupMessage = vm.importSettings(text)
+            }
+        }
+        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            OutlinedButton(onClick = {
+                backupExporter.launch("news_monitor_настройки.json")
+            }, modifier = Modifier.weight(1f)) { Text("Экспорт") }
+            OutlinedButton(onClick = {
+                backupImporter.launch(arrayOf("*/*"))
+            }, modifier = Modifier.weight(1f)) { Text("Импорт") }
+        }
+        Text("Экспорт сохраняет в файл ключевые слова, источники, ключ VK, " +
+            "интервал, тему и память об уже найденных новостях. Перед установкой " +
+            "новой версии приложения сделайте экспорт, после установки — импорт: " +
+            "всё вернётся, и старые новости не попадут в отчёт повторно.",
+            style = MaterialTheme.typography.bodySmall,
+            modifier = Modifier.padding(top = 4.dp))
+        if (backupMessage.isNotBlank()) {
+            Text(backupMessage, style = MaterialTheme.typography.bodyMedium,
+                color = MaterialTheme.colorScheme.primary,
+                modifier = Modifier.padding(top = 4.dp))
         }
     }
 }
@@ -974,24 +1160,12 @@ fun FeedsTab(config: Config, vm: MainViewModel) {
 
 @Composable
 fun VkTab(config: Config, vm: MainViewModel) {
-    var token by remember(config.vkToken) { mutableStateOf(config.vkToken) }
     Column(Modifier.fillMaxSize()) {
-        Column(Modifier.padding(12.dp)) {
-            OutlinedTextField(
-                value = token,
-                onValueChange = { new ->
-                    token = new
-                    vm.update { it.vkToken = new.trim() }   // сохраняется сразу при вводе
-                },
-                label = { Text("Ключ доступа VK (с dev.vk.com)") },
-                modifier = Modifier.fillMaxWidth(),
-            )
-            Text("Ключ сохраняется автоматически.",
-                style = MaterialTheme.typography.bodySmall)
-        }
         ListEditor(
             title = "Сообщества VK",
-            hint = "Сообщество можно указать любым способом: tass_agency или https://vk.com/tass_agency",
+            hint = "Сообщество можно указать любым способом: tass_agency или " +
+                "https://vk.com/tass_agency. Ключ доступа VK задаётся в настройках " +
+                "(значок шестерёнки вверху).",
             items = config.vkGroups,
             dialogLabel = "Новое сообщество VK",
             onAdd = { g -> vm.update { it.vkGroups.add(VkSource.normalizeGroup(g)) } },
