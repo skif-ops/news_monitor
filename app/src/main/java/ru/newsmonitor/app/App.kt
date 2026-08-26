@@ -137,7 +137,7 @@ object Storage {
         }
     }
 
-    fun saveConfig(context: Context, config: Config) {
+    fun saveConfig(context: Context, config: Config) = try {
         val o = JSONObject()
         o.put("keywords", JSONArray(config.keywords))
         o.put("feeds", JSONArray(config.feeds.map {
@@ -148,6 +148,7 @@ object Storage {
         o.put("intervalMinutes", config.intervalMinutes)
         o.put("autoCheck", config.autoCheck)
         file(context, "config.json").writeText(o.toString(2))
+    } catch (_: Exception) {
     }
 
     fun loadNews(context: Context): List<NewsItem> {
@@ -298,9 +299,11 @@ object Net {
 /** Поиск ключевых слов: по началу слова, без учёта регистра, с кириллицей. */
 object Matcher {
     fun compile(keywords: List<String>): List<Pair<String, Pattern>> = keywords.map { kw ->
+        // (?<![\p{L}\p{N}_]) — «перед словом нет буквы/цифры», работает с кириллицей
+        // одинаково на Android и на обычной Java, без спец-флагов
         kw to Pattern.compile(
-            "\\b" + Pattern.quote(kw.lowercase()),
-            Pattern.CASE_INSENSITIVE or Pattern.UNICODE_CASE or Pattern.UNICODE_CHARACTER_CLASS,
+            "(?<![\\p{L}\\p{N}_])" + Pattern.quote(kw.lowercase()),
+            Pattern.CASE_INSENSITIVE or Pattern.UNICODE_CASE,
         )
     }
 
@@ -704,7 +707,12 @@ class MainViewModel(private val app: android.app.Application) :
         _checking.value = true
         _status.value = "Идёт проверка..."
         viewModelScope.launch {
-            val result = withContext(Dispatchers.IO) { Checker.runCheck(app) }
+            val result = try {
+                withContext(Dispatchers.IO) { Checker.runCheck(app) }
+            } catch (e: Throwable) {
+                Checker.Result(emptyList(),
+                    listOf("Ошибка проверки: ${e.message ?: e.javaClass.simpleName}"))
+            }
             _news.value = Storage.loadNews(app).reversed()
             _status.value = result.log.lastOrNull() ?: "Готово"
             _checking.value = false
@@ -970,15 +978,16 @@ fun VkTab(config: Config, vm: MainViewModel) {
     Column(Modifier.fillMaxSize()) {
         Column(Modifier.padding(12.dp)) {
             OutlinedTextField(
-                value = token, onValueChange = { token = it },
+                value = token,
+                onValueChange = { new ->
+                    token = new
+                    vm.update { it.vkToken = new.trim() }   // сохраняется сразу при вводе
+                },
                 label = { Text("Ключ доступа VK (с dev.vk.com)") },
                 modifier = Modifier.fillMaxWidth(),
             )
-            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.End) {
-                TextButton(onClick = { vm.update { it.vkToken = token.trim() } }) {
-                    Text("Сохранить ключ")
-                }
-            }
+            Text("Ключ сохраняется автоматически.",
+                style = MaterialTheme.typography.bodySmall)
         }
         ListEditor(
             title = "Сообщества VK",
