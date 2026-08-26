@@ -5,6 +5,7 @@
 
     <application
         android:label="@string/app_name"
+        android:icon="@mipmap/ic_launcher"
         android:theme="@style/Theme.NewsMonitor">
         <activity
             android:name=".MainActivity"
@@ -16,3 +17,4 @@
         </activity>
     </application>
 </manifest>
+
