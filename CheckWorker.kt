@@ -1,28 +1,44 @@
-name: Сборка APK
-on:
-  push:
-  workflow_dispatch:
+plugins {
+    alias(libs.plugins.android.application)
+    alias(libs.plugins.kotlin.android)
+    alias(libs.plugins.kotlin.compose)
+}
 
-jobs:
-  build:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
+android {
+    namespace = "ru.newsmonitor.app"
+    compileSdk = 35
 
-      - uses: actions/setup-java@v4
-        with:
-          distribution: temurin
-          java-version: 17
+    defaultConfig {
+        applicationId = "ru.newsmonitor.app"
+        minSdk = 26
+        targetSdk = 35
+        versionCode = 1
+        versionName = "1.0"
+    }
 
-      - uses: gradle/actions/setup-gradle@v4
-        with:
-          gradle-version: "8.11.1"
+    buildTypes {
+        release {
+            isMinifyEnabled = true
+            isShrinkResources = true
+            proguardFiles(getDefaultProguardFile("proguard-android-optimize.txt"), "proguard-rules.pro")
+        }
+    }
 
-      - name: Сборка debug APK
-        run: gradle assembleDebug --stacktrace
+    compileOptions {
+        sourceCompatibility = JavaVersion.VERSION_17
+        targetCompatibility = JavaVersion.VERSION_17
+    }
+    kotlinOptions { jvmTarget = "17" }
+    buildFeatures { compose = true }
+}
 
-      - name: Выложить APK
-        uses: actions/upload-artifact@v4
-        with:
-          name: news-monitor-apk
-          path: app/build/outputs/apk/debug/*.apk
+dependencies {
+    implementation(libs.androidx.core.ktx)
+    implementation(libs.androidx.activity.compose)
+    implementation(libs.androidx.lifecycle.viewmodel.compose)
+    implementation(libs.androidx.work.runtime)
+    implementation(platform(libs.compose.bom))
+    implementation(libs.compose.ui)
+    implementation(libs.compose.material3)
+    implementation(libs.okhttp)
+}
